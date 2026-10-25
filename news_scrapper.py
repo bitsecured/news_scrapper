@@ -1,3 +1,40 @@
+"""
+News scraper: 10 sources x 1000 articles = 10,000 articles -> ONE csv file
+==========================================================================
+
+Why this version?  An RSS feed only holds the latest 10-50 items, so RSS alone
+can never reach 1000 per source.  This script therefore works in layers:
+
+  1. feedparser  : reads every RSS/Atom feed of the source (title, description,
+                   author, date come straight from the feed)
+  2. sitemaps    : if feeds give fewer than 1000 links, the site's sitemaps
+                   (found automatically via robots.txt, newest first) supply
+                   the rest of the article URLs
+  3. article page: fetched for every URL that is missing data. This is where
+                   the three source categories are handled:
+       simple     -> plain requests, many threads
+       captcha    -> a human solves ONE CAPTCHA in a visible Chrome window,
+                     cookies are then reused for fast requests
+       continuous -> every page opens in a real browser; the script pauses
+                     whenever a challenge appears until a human solves it
+  4. keep going  : candidates are processed in batches until the source really
+                   has 1000 valid articles (failed pages are skipped, not counted)
+  5. reserves    : if a source still ends short (blocked, no sitemap ...), spare
+                   sources are scraped automatically to replace it
+  6. final CSV   : the 10 best sources, max 1000 each, merged into one file
+
+Output columns : title, description, date_of_publication, author_name
+Date format    : YYYY-MM-DD (Asian/ISO).  Change DATE_FORMAT e.g. "%d-%m-%Y".
+
+Install : pip install feedparser requests beautifulsoup4 lxml python-dateutil pandas selenium
+Step 1  : python news_scraper_10k.py --check           (how many links each source can give)
+Step 2  : python news_scraper_10k.py --only bbc --limit 30      (small test)
+Step 3  : python news_scraper_10k.py                   (full run, safe to re-run: it resumes)
+
+CAPTCHAs are never bypassed automatically - a human solves them. Respect each
+site's Terms of Service; robots.txt is checked before page fetches.
+"""
+
 import argparse
 import gzip
 import json
@@ -320,71 +357,14 @@ def make_driver():
     return webdriver.Chrome(options=opts)            # Selenium Manager gets the driver
 
 
-
 def wait_for_human(driver, name):
     start = time.time()
-
-    # Stronger indicators of an actual verification page
-    body_markers = [
-        "are you a robot",
-        "verify you are human",
-        "verifying you are human",
-        "unusual traffic",
-        "press & hold",
-        "checking your browser",
-        "cf-challenge",
-        "access denied",
-    ]
-
-    log.info("[%s] Checking browser verification status...", name)
-
-    while time.time() - start < HUMAN_WAIT_TIMEOUT:
-        try:
-            title = (driver.title or "").lower()
-            url = (driver.current_url or "").lower()
-            soup = BeautifulSoup(driver.page_source, "lxml")
-            body = soup.get_text(" ", strip=True).lower()
-
-            title_challenge = any(
-                marker in title for marker in CHALLENGE_MARKERS
-            )
-            url_challenge = any(
-                marker in url for marker in CHALLENGE_MARKERS
-            )
-            body_matches = [
-                marker for marker in body_markers if marker in body
-            ]
-
-            # Require multiple body indicators to reduce false positives.
-            challenge = (
-                title_challenge
-                or url_challenge
-                or len(body_matches) >= 2
-            )
-
-            if not challenge:
-                log.info(
-                    "[%s] Verification appears complete. Title: %s | URL: %s",
-                    name, driver.title, driver.current_url
-                )
-                return
-
-            log.warning(
-                "[%s] Verification still detected. Title: %s | URL: %s | "
-                "Body indicators: %s",
-                name, driver.title, driver.current_url, body_matches
-            )
-
-        except Exception as e:
-            log.debug("[%s] Browser status check failed: %s", name, e)
-
+    if is_challenge(driver.page_source):
+        log.warning("[%s] Challenge detected - please solve it in the browser window...", name)
+    while is_challenge(driver.page_source):
+        if time.time() - start > HUMAN_WAIT_TIMEOUT:
+            raise TimeoutError("CAPTCHA not solved in time")
         time.sleep(3)
-
-    raise TimeoutError(
-        f"{name}: Verification did not finish within "
-        f"{HUMAN_WAIT_TIMEOUT} seconds"
-    )
-
 
 
 def browser_fetch_text(driver, url):
@@ -671,30 +651,20 @@ def check_sources(sources, limit):
 
 
 def merge_to_csv(results, limit, top_n):
-    # Prefer sources that actually reached the requested article count.
-    complete = [r for r in results if r["count"] >= limit]
-    counts = sorted(complete, key=lambda r: r["count"], reverse=True)[:top_n]
-
-    if len(counts) < top_n:
-        log.error(
-            "Only %d sources reached %d articles; cannot honestly produce "
-            "%d complete sources.",
-            len(counts), limit, top_n
-        )
-
+    counts = sorted(results, key=lambda r: r["count"], reverse=True)[:top_n]
     frames = []
     for r in counts:
+        if r["count"] == 0:
+            continue
         df = pd.read_csv(r["path"]).drop_duplicates(subset=["url"])
         df["_d"] = pd.to_datetime(df["date_of_publication"], errors="coerce")
-        df = df.sort_values("_d", ascending=False).head(limit)
-        df["source"] = r["name"]
-        frames.append(df)
+        frames.append(df.sort_values("_d", ascending=False).head(limit))
     if not frames:
         log.error("No data scraped.")
         return
     final = pd.concat(frames, ignore_index=True)
     final = final.sort_values("_d", ascending=False)             # latest first
-    final[COLS].to_csv(FINAL_CSV, index=False, encoding="utf-8-sig")
+    final[FIELDS].to_csv(FINAL_CSV, index=False, encoding="utf-8-sig")
 
     print("\n=========== REPORT ===========")
     for r in sorted(results, key=lambda r: r["count"], reverse=True):
