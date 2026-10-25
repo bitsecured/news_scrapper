@@ -1,4 +1,5 @@
 import argparse
+import glob
 import gzip
 import json
 import logging
@@ -7,7 +8,8 @@ import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import Pool
+from datetime import datetime, timedelta
+from multiprocessing import Pool, Value
 from urllib import robotparser
 from urllib.parse import urlparse
 
@@ -22,18 +24,25 @@ from urllib3.util.retry import Retry
 # --------------------------------------------------------------------------- #
 # CONFIG
 # --------------------------------------------------------------------------- #
-ARTICLES_PER_SOURCE = 10000     # 10 sources x 10,000 = 100,000 (1 lac) total
-TOP_N_SOURCES = 10              # final CSV = best 10 sources
+TOTAL_TARGET = 100000           # 1 lac: ALL sources together; the run stops when this is reached
+ARTICLES_PER_SOURCE = 10000     # max ONE source may contribute (--limit); the shared total is TOTAL_TARGET
+MAX_PROCESSES = 10              # sources running at the same time: the FIRST 10 in SOURCES start,
+                                # the rest are queued and start only when one of those finishes
 OVERSAMPLE = 1.6                # collect 60% more candidate URLs than needed
 BATCH = 200                     # articles processed per checkpoint
-THREADS_PER_SOURCE = 8          # only for "simple" / cookie-based fetching
+THREADS_PER_SOURCE = 4          # lower because every request now comes from your own IP
 MAX_SITEMAPS = 500              # max sitemap files opened per source
 
 # Rotating proxy (Webshare). Set the PROXY_URL environment variable to override.
 # Applied ONLY to "simple" sources: captcha cookies are tied to your IP, and
 # Selenium/Chrome can't take user:pass proxy auth, so those stay on your own IP.
-PROXY_URL = os.environ.get(
-    "PROXY_URL", "http://ewugqdrr:x5r97lcmrxjf@p.webshare.io:80/")
+# Webshare is set to IP Authentication: no user/pass, port 9999, and it only
+# accepts requests coming from the "Source IP Address" saved in the dashboard.
+DEFAULT_PROXY_URL = ""      # proxy OFF (Webshare bandwidth used up). To re-enable, set to
+                            # "http://p.webshare.io:9999/" or set the PROXY_URL env variable.
+_ENV_PROXY = os.environ.get("PROXY_URL")
+PROXY_URL = _ENV_PROXY if _ENV_PROXY is not None else DEFAULT_PROXY_URL
+PROXY_FROM_ENV = _ENV_PROXY is not None     # a stale env var silently overrides the file
 DATE_FORMAT = "%Y-%m-%d"
 UNKNOWN_AUTHOR = "Unknown"      # used when neither feed nor page names an author
 OUTPUT_DIR = "data"
@@ -65,62 +74,48 @@ SOURCES = [
         "https://www.theguardian.com/science/rss",
         "https://www.theguardian.com/environment/rss",
         "https://www.theguardian.com/politics/rss"]},
-    {"name": "aljazeera", "category": "simple", "root": "https://www.aljazeera.com", "feeds": [
-        "https://www.aljazeera.com/xml/rss/all.xml"]},
-    {"name": "dawn", "category": "simple", "root": "https://www.dawn.com", "feeds": [
-        "https://www.dawn.com/feeds/home",
-        "https://www.dawn.com/feeds/latest-news",
-        "https://www.dawn.com/feeds/pakistan",
-        "https://www.dawn.com/feeds/world",
-        "https://www.dawn.com/feeds/business"]},
-    {"name": "thehindu", "category": "simple", "root": "https://www.thehindu.com", "feeds": [
-        "https://www.thehindu.com/news/national/feeder/default.rss",
-        "https://www.thehindu.com/news/international/feeder/default.rss",
-        "https://www.thehindu.com/business/feeder/default.rss",
-        "https://www.thehindu.com/sport/feeder/default.rss"]},
-    {"name": "japantimes", "category": "captcha", "root": "https://www.japantimes.co.jp", "feeds": [
-        "https://www.japantimes.co.jp/feed/",
-        "https://www.japantimes.co.jp/news/feed/",
-        "https://www.japantimes.co.jp/business/feed/"]},
-    {"name": "scmp", "category": "captcha", "root": "https://www.scmp.com", "feeds": [
-        "https://www.scmp.com/rss/91/feed",
-        "https://www.scmp.com/rss/2/feed",
-        "https://www.scmp.com/rss/3/feed",
-        "https://www.scmp.com/rss/4/feed"]},
-    {"name": "straitstimes", "category": "captcha", "root": "https://www.straitstimes.com", "feeds": [
-        "https://www.straitstimes.com/news/world/rss.xml",
-        "https://www.straitstimes.com/news/asia/rss.xml",
-        "https://www.straitstimes.com/news/singapore/rss.xml",
-        "https://www.straitstimes.com/news/business/rss.xml"]},
-    {"name": "bloomberg", "category": "continuous", "root": "https://www.bloomberg.com", "feeds": [
-        "https://feeds.bloomberg.com/markets/news.rss",
-        "https://feeds.bloomberg.com/business/news.rss",
-        "https://feeds.bloomberg.com/technology/news.rss",
-        "https://feeds.bloomberg.com/politics/news.rss",
-        "https://feeds.bloomberg.com/wealth/news.rss"]},
-    {"name": "timesofindia", "category": "continuous", "root": "https://timesofindia.indiatimes.com", "feeds": [
-        "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
-        "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms",
-        "https://timesofindia.indiatimes.com/rssfeeds/-2128936835.cms",
-        "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms"]},
-]
-
-# Spare sources: used automatically only if a primary source ends below the target.
-RESERVE = [
-    {"name": "tribune", "category": "simple", "root": "https://tribune.com.pk", "feeds": [
+    {"name": "cbsnews", "category": "simple", "root": "https://www.cbsnews.com", "feeds": [
+        "https://www.cbsnews.com/latest/rss/main",
+        "https://www.cbsnews.com/latest/rss/world",
+        "https://www.cbsnews.com/latest/rss/technology",
+        "https://www.cbsnews.com/latest/rss/politics"]},
+    # --- plain-request sources (no captcha) added to replace the removed ones ---
+    {"name": "tribune", "category": "simple", "no_proxy": True, "threads": 2,   # slow server
+     "root": "https://tribune.com.pk", "feeds": [
         "https://tribune.com.pk/feed/home", "https://tribune.com.pk/feed/pakistan",
         "https://tribune.com.pk/feed/world", "https://tribune.com.pk/feed/business"]},
-    {"name": "hindustantimes", "category": "simple", "root": "https://www.hindustantimes.com", "feeds": [
-        "https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml",
-        "https://www.hindustantimes.com/feeds/rss/world-news/rssfeed.xml",
-        "https://www.hindustantimes.com/feeds/rss/business/rssfeed.xml"]},
     {"name": "dw", "category": "simple", "root": "https://www.dw.com", "feeds": [
         "https://rss.dw.com/rdf/rss-en-all", "https://rss.dw.com/rdf/rss-en-world",
         "https://rss.dw.com/rdf/rss-en-bus"]},
-    {"name": "cna", "category": "simple", "root": "https://www.channelnewsasia.com", "feeds": [
-        "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml"]},
     {"name": "npr", "category": "simple", "root": "https://www.npr.org", "feeds": [
-        "https://feeds.npr.org/1001/rss.xml", "https://feeds.npr.org/1004/rss.xml"]},
+        "https://feeds.npr.org/1001/rss.xml", "https://feeds.npr.org/1004/rss.xml",
+        "https://feeds.npr.org/1006/rss.xml", "https://feeds.npr.org/1014/rss.xml",
+        "https://feeds.npr.org/1019/rss.xml"]},
+    # --- more sources. Feed URLs below are from memory and UNTESTED: a dead feed only
+    # --- contributes 0 articles. Run `--check` to see which sources have real depth.
+    {"name": "abcnews_au", "category": "simple", "root": "https://www.abc.net.au", "feeds": [
+        "https://www.abc.net.au/news/feed/51120/rss.xml"]},
+    {"name": "independent", "category": "simple", "root": "https://www.independent.co.uk", "feeds": [
+        "https://www.independent.co.uk/news/world/rss",
+        "https://www.independent.co.uk/news/uk/rss",
+        "https://www.independent.co.uk/business/rss"]},
+    {"name": "foxnews", "category": "simple", "root": "https://www.foxnews.com", "feeds": [
+        "https://moxie.foxnews.com/google-publisher/latest.xml",
+        "https://moxie.foxnews.com/google-publisher/world.xml",
+        "https://moxie.foxnews.com/google-publisher/politics.xml",
+        "https://moxie.foxnews.com/google-publisher/tech.xml"]},
+    {"name": "nbcnews", "category": "simple", "root": "https://www.nbcnews.com", "feeds": [
+        "https://feeds.nbcnews.com/nbcnews/public/news",
+        "https://feeds.nbcnews.com/nbcnews/public/world",
+        "https://feeds.nbcnews.com/nbcnews/public/politics",
+        "https://feeds.nbcnews.com/nbcnews/public/business",
+        "https://feeds.nbcnews.com/nbcnews/public/tech"]},
+    {"name": "techcrunch", "category": "simple", "root": "https://techcrunch.com", "feeds": [
+        "https://techcrunch.com/feed/"]},
+    {"name": "theverge", "category": "simple", "root": "https://www.theverge.com", "feeds": [
+        "https://www.theverge.com/rss/index.xml"]},
+    {"name": "wired", "category": "simple", "root": "https://www.wired.com", "feeds": [
+        "https://www.wired.com/feed/rss"]},
 ]
 
 CHALLENGE_MARKERS = [
@@ -152,6 +147,29 @@ def make_session(use_proxy=False):
     s.mount("http://", HTTPAdapter(max_retries=retry))
     s.mount("https://", HTTPAdapter(max_retries=retry))
     return s
+
+
+def test_proxy():
+    """One-shot proxy login test. Returns (ok, message)."""
+    if not PROXY_URL:
+        return True, "no proxy configured"
+    try:
+        r = requests.get("https://ipv4.webshare.io/", timeout=20,
+                         proxies={"http": PROXY_URL, "https": PROXY_URL})
+        if r.status_code == 200:
+            return True, f"proxy OK, exit IP {r.text.strip()}"
+        return False, f"proxy answered HTTP {r.status_code}"
+    except requests.exceptions.ProxyError as e:
+        if "407" in str(e):
+            return False, ("407 Proxy Authentication Required: with IP Authentication "
+                           "this means your current public IP is not the Source IP saved "
+                           "in the Webshare dashboard (your ISP IP may have changed). "
+                           "Open https://ipv4.webshare.io/ in a browser (without the "
+                           "proxy), then paste that IP into Webshare > Proxy Settings "
+                           "> Source IP Address.")
+        return False, f"proxy error: {e}"
+    except requests.RequestException as e:
+        return False, f"proxy test failed: {e}"
 
 
 def is_challenge(html, status=200):
@@ -191,12 +209,22 @@ def clean_text(html):
 
 
 def fmt_date(raw):
+    """Parse a date string to YYYY-MM-DD. Returns "" for year-less dates (dateutil would
+    silently insert the current year) and for dates in the future."""
     if not raw:
         return ""
     try:
-        return dtparser.parse(raw).strftime(DATE_FORMAT)
+        d = dtparser.parse(raw, default=datetime(1900, 1, 1))
     except Exception:
         return ""
+    if d.year == 1900 or d.replace(tzinfo=None) > datetime.now() + timedelta(days=1):
+        return ""
+    return d.strftime(DATE_FORMAT)
+
+
+def clean_url(u):
+    """Drop tracking query strings (BBC adds ?at_medium=RSS&at_campaign=rss) so one article = one URL."""
+    return re.sub(r"\?(?:at_|utm_)[^#]*", "", u or "")
 
 
 def blank_row(url, lastmod="", source=""):
@@ -217,7 +245,7 @@ def entry_to_row(e, source):
         date = time.strftime(DATE_FORMAT, e["updated_parsed"])
     else:
         date = fmt_date(e.get("published") or e.get("updated"))
-    row = blank_row(e.get("link", ""), source=source)
+    row = blank_row(clean_url(e.get("link", "")), source=source)
     row.update({
         "title": clean_text(e.get("title", "")),
         "description": clean_text(e.get("summary") or e.get("description", "")),
@@ -321,11 +349,15 @@ def collect_sitemap_entries(cfg, raw_get, want, max_sitemaps=MAX_SITEMAPS):
 # --------------------------------------------------------------------------- #
 # LAYER 3: ARTICLE-PAGE FETCHERS (the three categories)
 # --------------------------------------------------------------------------- #
-def make_driver():
+def make_driver(use_proxy=False):
     from selenium import webdriver
     opts = webdriver.ChromeOptions()
     opts.add_argument(f"--user-agent={USER_AGENT}")
     opts.add_argument("--window-size=1200,900")
+    if use_proxy and PROXY_URL:
+        # Chrome cannot send user:pass, so this only works with IP Authentication
+        host = urlparse(PROXY_URL).netloc.split("@")[-1]
+        opts.add_argument(f"--proxy-server=http://{host}")
     return webdriver.Chrome(options=opts)            # Selenium Manager gets the driver
 
 
@@ -415,11 +447,11 @@ class SimpleFetcher:
 
     def __init__(self, cfg):
         self.name = cfg["name"]
-        self.session = make_session(use_proxy=self.USE_PROXY)
+        self.session = make_session(use_proxy=self.USE_PROXY and not cfg.get("no_proxy", False))
 
     def get(self, url):
         try:
-            r = self.session.get(url, timeout=20)
+            r = self.session.get(url, timeout=40)
             return None if is_challenge(r.text, r.status_code) else r.text
         except requests.RequestException:
             return None
@@ -471,7 +503,7 @@ class ContinuousFetcher:
     """Category 3: every page in a real browser; pause on every challenge."""
     def __init__(self, cfg):
         self.name = cfg["name"]
-        self.driver = make_driver()
+        self.driver = make_driver(use_proxy=cfg.get("use_proxy", False))
         self.driver.get(cfg["root"])
         wait_for_human(self.driver, self.name)
 
@@ -536,7 +568,9 @@ def parse_page(html):
         soup.title.string.strip() if soup.title and soup.title.string else "")
     out["description"] = out["description"] or meta("og:description", "description")
     out["date_of_publication"] = out["date_of_publication"] or fmt_date(
-        meta("article:published_time", "datePublished", "pubdate", "date"))
+        meta("article:published_time", "og:article:published_time", "datePublished", "pubdate",
+             "date", "parsely-pub-date", "sailthru.date", "DC.date.issued", "dcterms.created",
+             "publish-date", "publication_date"))
     if not out["date_of_publication"]:
         t = soup.find("time")
         if t:
@@ -548,6 +582,174 @@ def parse_page(html):
 # --------------------------------------------------------------------------- #
 # ONE SOURCE (runs in its own process)
 # --------------------------------------------------------------------------- #
+# ---- shared counter: ONE total across every source (every process) ---------- #
+_shared = {"count": None, "target": TOTAL_TARGET}
+
+
+def init_worker(count, target):
+    """Runs once in each worker process; hands it the shared counter."""
+    _shared["count"], _shared["target"] = count, target
+
+
+def claim(n=1):
+    """Reserve n slots in the shared total. Returns how many were granted (0 = total reached)."""
+    c = _shared["count"]
+    if c is None:
+        return n
+    with c.get_lock():
+        grant = max(0, min(n, _shared["target"] - c.value))
+        c.value += grant
+    return grant
+
+
+def total_now():
+    c = _shared["count"]
+    return c.value if c is not None else 0
+
+
+def total_left():
+    return max(0, _shared["target"] - total_now())
+
+
+def total_reached():
+    return _shared["count"] is not None and total_left() == 0
+
+
+def saved_count(name):
+    """Articles already saved for a source (so a restart keeps counting from there)."""
+    path = os.path.join(OUTPUT_DIR, f"{name}.csv")
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return 0
+    try:
+        return len(pd.read_csv(path, usecols=["url"]))
+    except Exception:
+        return 0
+
+
+# ---- keeping the saved files clean ------------------------------------------ #
+ARCHIVE_DIR = os.path.join(OUTPUT_DIR, "archive_stopped")
+PRIORITY_MIN = 5000             # sources already holding this many articles are filled first
+_ISO = re.compile(r"^\d{4}-\d{2}-\d{2}")
+_DMY = re.compile(r"^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})")
+
+
+def normalize_date(v):
+    """Any date value already saved -> YYYY-MM-DD, or "" when it is not a real, past date.
+    Handles ISO (with or without a time) and day/month/year (what Excel writes)."""
+    v = str(v).strip()
+    if not v or v.lower() in ("nan", "nat", "none"):
+        return ""
+    try:
+        if _ISO.match(v):
+            d = datetime.strptime(v[:10], "%Y-%m-%d")
+        else:
+            m = _DMY.match(v)
+            if not m:
+                return fmt_date(v)           # let dateutil try; it also rejects year-less/future
+            d = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    except ValueError:
+        return ""
+    return "" if d > datetime.now() + timedelta(days=1) else d.strftime(DATE_FORMAT)
+
+
+def archive_stopped():
+    """Move the csv of every source that is no longer in SOURCES out of data/ (reversible:
+    move the file back to undo). Their articles are then no longer counted anywhere."""
+    active = {s["name"] for s in SOURCES}
+    for f in sorted(glob.glob(os.path.join(OUTPUT_DIR, "*.csv"))):
+        nm = os.path.basename(f)[:-4]
+        if nm in active:
+            continue
+        n = saved_count(nm)
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        os.replace(f, os.path.join(ARCHIVE_DIR, os.path.basename(f)))
+        log.info("archived %s (%d articles) -> %s/  (no longer counted)", nm, n, ARCHIVE_DIR)
+
+
+def normalize_saved(sources):
+    """Fix dates and URLs inside the saved files (no network): day/month/year -> ISO,
+    impossible dates blanked, tracking query strings stripped, duplicate URLs dropped."""
+    for cfg in sources:
+        name = cfg["name"]
+        path = os.path.join(OUTPUT_DIR, f"{name}.csv")
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            continue
+        try:
+            df = pd.read_csv(path, dtype=str).fillna("")
+        except Exception as e:
+            log.error("[%s] could not read %s: %s", name, path, e)
+            continue
+        old = df["date_of_publication"]
+        new = old.map(normalize_date)
+        fixed = int((old != new).sum())
+        df["date_of_publication"] = new
+        df["url"] = df["url"].map(clean_url)
+        n0 = len(df)
+        df = df.drop_duplicates(subset="url")
+        if fixed or len(df) != n0:
+            df[COLS].to_csv(path, index=False, encoding="utf-8-sig")
+            log.info("[%s] cleaned saved file: %d dates fixed, %d duplicate URLs removed",
+                     name, fixed, n0 - len(df))
+        blank = int((df["date_of_publication"] == "").sum())
+        if blank:
+            log.info("[%s] %d articles still have no valid date "
+                     "(python news_scrapper.py --fix-dates re-reads their pages)", name, blank)
+
+
+def run_order(sources, limit, counts=None):
+    """Which sources need to run, in order. Sources already at the cap are left out.
+    Sources that already hold >= PRIORITY_MIN articles come first (biggest first), so they
+    keep filling up to the cap; the others follow in list order."""
+    counts = counts or {s["name"]: saved_count(s["name"]) for s in sources}
+    todo = [s for s in sources if counts[s["name"]] < limit]
+    prio = sorted((s for s in todo if counts[s["name"]] >= PRIORITY_MIN),
+                  key=lambda s: -counts[s["name"]])
+    rest = [s for s in todo if counts[s["name"]] < PRIORITY_MIN]
+    return prio + rest
+
+
+def refetch_missing_dates(sources):
+    """Open the article page again for every saved article that still has no valid date."""
+    for cfg in sources:
+        name = cfg["name"]
+        path = os.path.join(OUTPUT_DIR, f"{name}.csv")
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            continue
+        df = pd.read_csv(path, dtype=str).fillna("")
+        idx = list(df.index[df["date_of_publication"] == ""])
+        if not idx:
+            continue
+        if cfg["category"] != "simple":
+            log.info("[%s] %d undated articles skipped (browser source)", name, len(idx))
+            continue
+        log.info("[%s] re-reading %d pages to recover dates", name, len(idx))
+        fetcher = SimpleFetcher(cfg)
+
+        def work(i, fetcher=fetcher, df=df):
+            url = df.at[i, "url"]
+            if not allowed_by_robots(url):
+                return i, ""
+            time.sleep(random.uniform(0.1, 0.4))
+            html = fetcher.get(url)
+            return i, (parse_page(html)["date_of_publication"] if html else "")
+
+        got = 0
+        try:
+            with ThreadPoolExecutor(cfg.get("threads", THREADS_PER_SOURCE)) as pool:
+                for n, (i, d) in enumerate(pool.map(work, idx), 1):
+                    if d:
+                        df.at[i, "date_of_publication"] = d
+                        got += 1
+                    if n % 500 == 0:
+                        df[COLS].to_csv(path, index=False, encoding="utf-8-sig")
+                        log.info("[%s] %d/%d pages read, %d dates recovered", name, n, len(idx), got)
+        finally:
+            fetcher.close()
+            df[COLS].to_csv(path, index=False, encoding="utf-8-sig")
+        log.info("[%s] recovered %d of %d dates; %d still undated (the page has no date)",
+                 name, got, len(idx), len(idx) - got)
+
+
 def needs_page(row, mode):
     if not row["title"]:
         return True                       # sitemap-only rows must be fetched
@@ -562,17 +764,22 @@ def scrape_source(cfg):
     name, target = cfg["name"], cfg["limit"]
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_path = os.path.join(OUTPUT_DIR, f"{name}.csv")
+    if total_reached():                   # a queued source whose turn came after the goal was met
+        log.info("[%s] skipped: the shared total is already reached", name)
+        return {"name": name, "path": out_path, "count": 0}
 
     rows, done = [], set()                                   # resume support
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         try:
-            old = pd.read_csv(out_path).fillna("")
+            old = pd.read_csv(out_path, dtype=str).fillna("")
             rows, done = old.to_dict("records"), set(old["url"])
             log.info("[%s] resuming with %d saved articles", name, len(rows))
         except Exception:
             pass
 
-    session = make_session(use_proxy=(cfg["category"] == "simple"))
+    use_proxy = ((cfg["category"] == "simple" or cfg.get("use_proxy", False))
+                 and not cfg.get("no_proxy", False))      # "no_proxy": True = go direct
+    session = make_session(use_proxy=use_proxy)
     holder = {"fetcher": None}
 
     def get_fetcher():
@@ -592,7 +799,8 @@ def scrape_source(cfg):
             return get_fetcher().get_raw(url)                # use verified browser/cookies
         return None
 
-    pool = ThreadPoolExecutor(THREADS_PER_SOURCE) if cfg["category"] in ("simple", "captcha") else None
+    pool = (ThreadPoolExecutor(cfg.get("threads", THREADS_PER_SOURCE))
+            if cfg["category"] in ("simple", "captcha") else None)
     try:
         # ---- candidates: feeds first, then sitemaps ----
         cands = [r for r in collect_feed_rows(cfg, session) if r["url"] not in done]
@@ -605,10 +813,13 @@ def scrape_source(cfg):
         log.info("[%s] %d candidates for %d missing articles", name, len(cands), need)
 
         # ---- process in batches until the target is really reached ----
-        for i in range(0, len(cands), BATCH):
-            if len(rows) >= target:
+        i = 0
+        while i < len(cands):
+            if len(rows) >= target or total_reached():
                 break
-            batch = cands[i:i + BATCH]
+            size = min(BATCH, max(20, total_left()))          # smaller batches near the end
+            batch = cands[i:i + size]
+            i += size
             todo = [r for r in batch if needs_page(r, cfg["enrich"])]
             if todo:
                 fetcher = get_fetcher()
@@ -633,13 +844,15 @@ def scrape_source(cfg):
             for r in batch:
                 if not r["title"] or r["url"] in done or len(rows) >= target:
                     continue
+                if claim(1) == 0:                              # the shared total is full
+                    break
                 r["date_of_publication"] = r["date_of_publication"] or fmt_date(r.get("_lastmod", ""))
                 r["author_name"] = r["author_name"] or UNKNOWN_AUTHOR
                 r["source"] = name
                 rows.append(r)
                 done.add(r["url"])
             pd.DataFrame(rows, columns=COLS).to_csv(out_path, index=False, encoding="utf-8-sig")
-            log.info("[%s] %d/%d articles", name, len(rows), target)
+            log.info("[%s] %d saved | TOTAL %d/%d", name, len(rows), total_now(), _shared["target"])
     except Exception as e:
         log.error("[%s] stopped by error: %s", name, e)
     finally:
@@ -650,104 +863,192 @@ def scrape_source(cfg):
             holder["fetcher"].close()
         if rows:
             pd.DataFrame(rows, columns=COLS).to_csv(out_path, index=False, encoding="utf-8-sig")
-        flag = "OK" if len(rows) >= target else "SHORT"
-        log.info("[%s] finished: %d/%d articles (%s)", name, len(rows), target, flag)
+        why = ("source cap reached" if len(rows) >= target
+               else "total reached" if total_reached() else "no more articles found")
+        log.info("[%s] finished: %d articles (%s) | TOTAL %d/%d",
+                 name, len(rows), why, total_now(), _shared["target"])
     return {"name": name, "path": out_path, "count": len(rows)}
 
 
 # --------------------------------------------------------------------------- #
 # CHECK, MERGE, MAIN
 # --------------------------------------------------------------------------- #
-def check_sources(sources, limit):
+def check_sources(sources, limit, total_target):
     """Dry run: how many article links can each source give (plain requests only)?"""
-    s = make_session()
+    holder = {}
+    reach = 0
 
     def raw_get(url):
         try:
-            r = s.get(url, timeout=30)
+            r = holder["s"].get(url, timeout=30)
             return r.content if r.status_code == 200 else None
         except requests.RequestException:
             return None
 
     print(f"\n{'source':<15}{'category':<12}{'feeds':>7}{'sitemap':>9}{'total':>8}  verdict")
     for cfg in sources:
+        # same network path as the real run: proxy for "simple" sources
+        s = holder["s"] = make_session(use_proxy=(cfg["category"] == "simple"))
         feed_urls = {r["url"] for r in collect_feed_rows(cfg, s)}
-        sm = collect_sitemap_entries(cfg, raw_get, limit * 2, max_sitemaps=8)
+        sm = collect_sitemap_entries(cfg, raw_get, limit * 2, max_sitemaps=40)
         total = len(feed_urls | {u for u, _ in sm})
+        reach += min(total, limit)
         if total >= limit:
-            verdict = "OK"
-        elif total == 0 and cfg["category"] != "simple":
-            verdict = "blocked for plain requests (browser will be used)"
+            verdict = f"OK (capped at {limit})"
+        elif total == 0:
+            verdict = "nothing reachable (blocked, dead feed or no sitemap)"
         else:
-            verdict = "SHORT - add feeds/sitemaps or use a reserve"
+            verdict = "partial"
         print(f"{cfg['name']:<15}{cfg['category']:<12}{len(feed_urls):>7}{len(sm):>9}{total:>8}  {verdict}")
+    print(f"\nEstimated reachable articles, all sources together: {reach}  (goal {total_target})")
+    print("Note: the sitemap column only opens 40 sitemaps here, so this is a lower bound.")
 
 
-def merge_to_csv(results, limit, top_n):
-    # Prefer sources that actually reached the requested article count.
-    complete = [r for r in results if r["count"] >= limit]
-    counts = sorted(complete, key=lambda r: r["count"], reverse=True)[:top_n]
-
-    if len(counts) < top_n:
-        log.error(
-            "Only %d sources reached %d articles; cannot honestly produce "
-            "%d complete sources.",
-            len(counts), limit, top_n
-        )
-
+def merge_to_csv(total_target):
+    """Merge the csv of EVERY running source into one file, newest first.
+    Sources that are no longer running are not included."""
     frames = []
-    for r in counts:
-        df = pd.read_csv(r["path"]).drop_duplicates(subset=["url"])
-        df["_d"] = pd.to_datetime(df["date_of_publication"], errors="coerce")
-        df = df.sort_values("_d", ascending=False).head(limit)
-        df["source"] = r["name"]
+    for cfg in SOURCES:
+        path = os.path.join(OUTPUT_DIR, f"{cfg['name']}.csv")
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            continue
+        try:
+            df = pd.read_csv(path).fillna("")
+        except Exception as e:
+            log.error("could not read %s: %s", path, e)
+            continue
+        df["source"] = cfg["name"]
         frames.append(df)
     if not frames:
         log.error("No data scraped.")
         return
     final = pd.concat(frames, ignore_index=True)
-    final = final.sort_values("_d", ascending=False)             # latest first
+    final["url"] = final["url"].astype(str).map(clean_url)
+    final = final.drop_duplicates(subset="url", keep="first")
+    final["_d"] = pd.to_datetime(final["date_of_publication"], format=DATE_FORMAT, errors="coerce")
+    final = final.sort_values("_d", ascending=False, na_position="last").head(total_target)
     final[COLS].to_csv(FINAL_CSV, index=False, encoding="utf-8-sig")
 
     print("\n=========== REPORT ===========")
-    for r in sorted(results, key=lambda r: r["count"], reverse=True):
-        used = "used" if r in counts else "not used"
-        print(f"{r['name']:<15}{r['count']:>6} articles   ({used})")
-    print(f"\nFINAL CSV: {FINAL_CSV}  ->  {len(final)} articles "
-          f"(target {limit * top_n})")
+    for name, n in final["source"].value_counts().items():
+        print(f"{name:<18}{n:>7} articles")
+    note = "" if len(final) >= total_target else "   <- below goal: the sources ran out of articles"
+    print(f"\nFINAL CSV: {FINAL_CSV}  ->  {len(final)} articles from "
+          f"{final['source'].nunique()} sources (goal {total_target}){note}")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", help="comma-separated source names (primary or reserve)")
-    ap.add_argument("--limit", type=int, default=ARTICLES_PER_SOURCE, help="articles per source")
+    ap.add_argument("--only", help="comma-separated source names")
+    ap.add_argument("--limit", type=int, default=ARTICLES_PER_SOURCE,
+                    help="max articles ONE source may contribute")
+    ap.add_argument("--total", type=int, default=TOTAL_TARGET,
+                    help="stop when all sources together reach this many articles")
     ap.add_argument("--enrich", choices=["none", "missing", "all"], default="missing",
                     help="fetch article pages: never / when a field is missing / always")
-    ap.add_argument("--no-reserve", action="store_true", help="do not use reserve sources")
     ap.add_argument("--check", action="store_true", help="dry run: count reachable links")
+    ap.add_argument("--no-proxy", action="store_true", help="do not use the proxy at all")
+    ap.add_argument("--status", action="store_true",
+                    help="show how many articles are collected so far (reads data/*.csv only)")
+    ap.add_argument("--fix-dates", action="store_true",
+                    help="re-open the pages of saved articles that have no valid date and read the date again")
     args = ap.parse_args()
 
-    primaries = SOURCES
+    if args.status:
+        active = {s["name"] for s in SOURCES}
+        files = {os.path.basename(f)[:-4]: f for f in glob.glob(os.path.join(OUTPUT_DIR, "*.csv"))}
+        frames = {}
+        for nm in active & set(files):
+            try:
+                frames[nm] = pd.read_csv(files[nm], dtype=str).fillna("")
+            except Exception as e:
+                print(f"{nm:<18} unreadable: {e}")
+        counts = {s["name"]: len(frames[s["name"]]) if s["name"] in frames else 0 for s in SOURCES}
+        queue = [s["name"] for s in run_order(SOURCES, args.limit, counts)]
+        total = 0
+        print(f"\n{'source':<18}{'articles':>9}{'limit':>8}{'bad dates':>11}  newest valid date")
+        for cfg in SOURCES:
+            nm, n = cfg["name"], counts[cfg["name"]]
+            total += n
+            if n >= args.limit:
+                tag = "   (full)"
+            elif nm in queue and queue.index(nm) >= MAX_PROCESSES:
+                tag = f"   (queued: starts when one of the first {MAX_PROCESSES} finishes)"
+            else:
+                tag = ""
+            df = frames.get(nm)
+            if df is None or df.empty:
+                print(f"{nm:<18}{0:>9}{args.limit:>8}{0:>11}  -{tag}")
+                continue
+            dates = pd.to_datetime(df["date_of_publication"], format=DATE_FORMAT, errors="coerce")
+            bad = dates.isna() | (dates > pd.Timestamp.now() + pd.Timedelta(days=1))   # blank, odd format, future
+            odd = int(bad.sum())
+            ok = dates[~bad]
+            newest = ok.max().strftime(DATE_FORMAT) if ok.notna().any() else "-"
+            dup = n - df["url"].nunique()
+            eg = ""
+            if odd:
+                vals = df.loc[bad, "date_of_publication"].drop_duplicates().head(2)
+                eg = "   bad dates look like: " + ", ".join(repr(v) if v else "(blank)" for v in vals)
+            print(f"{nm:<18}{n:>9}{args.limit:>8}{odd:>11}  {newest}"
+                  + (f"   ({dup} duplicate URLs)" if dup else "") + tag + eg)
+        print(f"\nTOTAL (running sources only) = {total}  /  goal {args.total}"
+              f"  ({100 * total / args.total:.0f}%, {max(0, args.total - total)} to go)")
+        stopped = {nm: saved_count(nm) for nm in sorted(set(files) - active)}
+        if stopped:
+            print("Not counted, no longer running (moved to data/archive_stopped/ on the next run): "
+                  + ", ".join(f"{k} {v}" for k, v in stopped.items()))
+        raise SystemExit
+
+    if args.no_proxy:
+        os.environ["PROXY_URL"] = ""      # child processes re-read this on import
+        PROXY_URL = ""
+    else:
+        src = "environment variable PROXY_URL" if PROXY_FROM_ENV else "built-in default"
+        log.info("Testing proxy (taken from %s)...", src)
+        ok, msg = test_proxy()
+        log.info(msg)
+        if not ok:
+            log.error("Stopping: fix the proxy, or rerun with --no-proxy. "
+                      "If PROXY_URL is set in your terminal, clear it: "
+                      "Remove-Item Env:PROXY_URL")
+            raise SystemExit(1)
+
+    sources = SOURCES
     if args.only:
         wanted = {n.strip() for n in args.only.split(",")}
-        primaries = [s for s in SOURCES + RESERVE if s["name"] in wanted]
+        sources = [s for s in SOURCES if s["name"] in wanted]
 
     if args.check:
-        check_sources(primaries + ([] if args.only else RESERVE), args.limit)
+        check_sources(sources, args.limit, args.total)
         raise SystemExit
 
     def prep(lst):
         return [{**s, "limit": args.limit, "enrich": args.enrich} for s in lst]
 
-    with Pool(processes=len(primaries)) as p:                    # all sources at once
-        results = p.map(scrape_source, prep(primaries))
+    # Housekeeping before anything runs (no network): sources that no longer run are moved
+    # out of data/ so they stop counting, and dates/URLs in the saved files are cleaned.
+    archive_stopped()
+    normalize_saved(sources)
+    if args.fix_dates:
+        refetch_missing_dates(sources)
+        raise SystemExit
 
-    short = [r for r in results if r["count"] < args.limit]
-    if short and not args.only and not args.no_reserve:
-        spare = RESERVE[:len(short)]
-        log.warning("%d source(s) ended short -> scraping reserves: %s",
-                    len(short), ", ".join(s["name"] for s in spare))
-        with Pool(processes=len(spare)) as p:
-            results += p.map(scrape_source, prep(spare))
+    # The running sources share ONE counter. The run stops as soon as the counter reaches
+    # --total (or when every source has run dry). Sources already holding 5,000+ articles go
+    # first so they keep filling up to the per-source limit; sources already full are skipped.
+    initial = sum(saved_count(s["name"]) for s in SOURCES)
+    queue = run_order(sources, args.limit)
+    full = [s["name"] for s in sources if s not in queue]
+    log.info("saved %d / goal %d | %d sources to fill, %d already full%s",
+             initial, args.total, len(queue), len(full), f" ({', '.join(full)})" if full else "")
+    log.info("starting order: %s", ", ".join(s["name"] for s in queue[:MAX_PROCESSES]))
+    if initial < args.total and queue:
+        counter = Value("i", initial)
+        with Pool(processes=min(len(queue), MAX_PROCESSES),
+                  initializer=init_worker, initargs=(counter, args.total)) as p:
+            p.map(scrape_source, prep(queue), chunksize=1)
+    else:
+        log.info("nothing to scrape (goal reached or every source is full), merging only")
 
-    merge_to_csv(results, args.limit, TOP_N_SOURCES if not args.only else len(primaries))
+    merge_to_csv(args.total)
